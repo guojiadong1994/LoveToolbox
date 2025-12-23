@@ -10,10 +10,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4       # 这里我更新到了 v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5   # 这里我更新到了 v5
       with:
         python-version: '3.10'
 
@@ -26,7 +26,7 @@ jobs:
         pyinstaller --name="LoveToolbox" --windowed --onefile --clean --noconfirm main.py
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4  # 关键修复：这里必须是 v4，之前是 v3 导致了报错
       with:
         name: LoveToolbox_EXE
         path: dist/LoveToolbox.exe
