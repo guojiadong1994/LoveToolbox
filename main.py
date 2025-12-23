@@ -8,6 +8,7 @@ from PyQt6.QtGui import QFont
 from apps.watermark_app import WatermarkRemover
 from apps.downloader_app import DownloaderApp
 from apps.video_sorter_app import VideoSorterApp
+from apps.renamer_app import RenamerApp
 
 class LauncherWindow(QMainWindow):
     def __init__(self):
@@ -43,8 +44,10 @@ class LauncherWindow(QMainWindow):
     def init_apps(self):
         # 参数：图标文字，点击后的回调函数，行，列
         self.add_app_icon("🖼️\n图片去水印", self.open_watermark_app, 0, 0)
-        self.add_app_icon("⬇️\n全能下载\n(开发中)", self.open_downloader_app, 0, 1)
+        self.add_app_icon("⬇️\n全能下载\n", self.open_downloader_app, 0, 1)
         self.add_app_icon("🎬\n视频分类整理", self.open_sorter_app, 0, 2)
+        # 1行0列：重命名工具 (新增)
+        self.add_app_icon("🔢\n分组重命名", self.open_renamer_app, 1, 0)
 
     def add_app_icon(self, text, callback, row, col):
         """创建一个类似APP图标的按钮"""
@@ -92,6 +95,10 @@ class LauncherWindow(QMainWindow):
     def open_sorter_app(self):
         self.sorter_window = VideoSorterApp()
         self.sorter_window.show()
+
+    def open_renamer_app(self):
+        self.renamer_window = RenamerApp()
+        self.renamer_window.show()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
