@@ -1,0 +1,32 @@
+name: Build EXE for Girlfriend
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Build EXE
+      run: |
+        pyinstaller --name="LoveToolbox" --windowed --onefile --clean --noconfirm main.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: LoveToolbox_EXE
+        path: dist/LoveToolbox.exe
