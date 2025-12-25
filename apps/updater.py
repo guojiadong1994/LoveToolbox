@@ -11,7 +11,7 @@ from PyQt6.QtCore import Qt
 # 👇 请修改你的仓库名 (格式: 用户名/仓库名)
 GITHUB_REPO = "guojiadong1994/LoveToolbox"
 # 👇 每次发布新版本前，记得修改这里
-CURRENT_VERSION = "v1.0"
+CURRENT_VERSION = "v1.1"
 
 
 # ==========================================
