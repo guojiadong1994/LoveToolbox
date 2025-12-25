@@ -27,24 +27,25 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        pip install -r LoveToolbox/requirements.txt
+        # 直接在根目录安装，不需要加前缀
+        pip install -r requirements.txt
         pip install requests
 
     # --- Windows 打包逻辑 ---
     - name: Build Windows EXE
       if: runner.os == 'Windows'
       run: |
-        # 打包，指定名字带上系统标识
+        # 直接打包
         pyinstaller --name="LoveToolbox-Windows" --windowed --onefile --clean --noconfirm main.py
 
     # --- macOS 打包逻辑 ---
     - name: Build macOS App
       if: runner.os == 'macOS'
       run: |
-        # Mac下打包为 .app 文件夹
+        # 直接打包
         pyinstaller --name="LoveToolbox" --windowed --clean --noconfirm main.py
         
-        # 将 .app 压缩为 .zip (Mac下分发通常用zip，方便下载和更新)
+        # 将 .app 压缩为 .zip
         cd dist
         zip -r LoveToolbox-macOS.zip LoveToolbox.app
 
@@ -53,9 +54,8 @@ jobs:
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        # Windows 上传 exe，Mac 上传 zip
         files: |
-          LoveToolbox/dist/LoveToolbox-Windows.exe
-          LoveToolbox/dist/LoveToolbox-macOS.zip
+          dist/LoveToolbox-Windows.exe
+          dist/LoveToolbox-macOS.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
