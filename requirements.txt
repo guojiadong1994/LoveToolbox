@@ -1,8 +1,6 @@
 PyQt6
 opencv-python
-numpy
+Pillow
+requests
 pandas
 openpyxl
-requests
-Pillow
-pyinstaller

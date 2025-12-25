@@ -1,491 +1,760 @@
 import sys
 import os
 import time
-import random
-import string
-import mimetypes
+import hashlib
 import requests
 import pandas as pd
-from urllib.parse import urlparse
+import mimetypes
+import shutil
+import cv2
+import re
+import json
+from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QLineEdit, QFileDialog, QComboBox, 
-                             QSlider, QProgressBar, QTextEdit, QGroupBox, 
-                             QRadioButton, QMessageBox, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                             QLabel, QLineEdit, QFileDialog, QComboBox,
+                             QProgressBar, QTextEdit, QGroupBox, QMessageBox,
+                             QListWidget, QListWidgetItem, QAbstractItemView,
+                             QTreeWidget, QTreeWidgetItem, QSplitter, QCheckBox,
+                             QSpinBox, QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QApplication)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings
+from PyQt6.QtGui import QFont, QColor, QAction, QIcon, QDragEnterEvent, QDropEvent
 
-# --- 核心下载逻辑线程 ---
+# 防止 OpenCV 多线程与 ThreadPool 冲突
+cv2.setNumThreads(0)
+
+
+# === 0. 错误报告详情弹窗 ===
+class ErrorReportDialog(QDialog):
+    def __init__(self, failed_tasks, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚠️ 下载失败任务详情")
+        self.resize(1100, 600)
+        self.failed_tasks = failed_tasks
+
+        layout = QVBoxLayout()
+        lbl = QLabel(f"共 {len(failed_tasks)} 个文件失败。请导出清单，根据【行号】回溯检查。")
+        lbl.setStyleSheet("color: red; font-weight: bold; font-size: 14px;")
+        layout.addWidget(lbl)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Excel行号", "Sheet名称", "Hook ID", "文件名", "下载链接", "错误原因"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 80);
+        self.table.setColumnWidth(1, 100);
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(3, 200);
+        self.table.setColumnWidth(4, 300);
+        self.table.setColumnWidth(5, 200)
+        layout.addWidget(self.table)
+
+        self.table.setRowCount(len(failed_tasks))
+        for i, task in enumerate(failed_tasks):
+            self.table.setItem(i, 0, QTableWidgetItem(str(task.get('row_num', '-'))))
+            self.table.setItem(i, 1, QTableWidgetItem(str(task.get('sheet', ''))))
+            self.table.setItem(i, 2, QTableWidgetItem(str(task.get('hook', ''))))
+            self.table.setItem(i, 3, QTableWidgetItem(str(task.get('name', ''))))
+            self.table.setItem(i, 4, QTableWidgetItem(str(task.get('url', ''))))
+            err_item = QTableWidgetItem(str(task.get('error', '未知')))
+            err_item.setForeground(Qt.GlobalColor.red)
+            self.table.setItem(i, 5, err_item)
+
+        hbox = QHBoxLayout()
+        btn_export = QPushButton("📉 导出失败清单 (含行号)")
+        btn_export.setStyleSheet("background-color: #2196f3; color: white; font-weight: bold;")
+        btn_export.clicked.connect(self.export_excel)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        hbox.addWidget(btn_export);
+        hbox.addStretch();
+        hbox.addWidget(btn_close)
+        layout.addLayout(hbox)
+        self.setLayout(layout)
+
+    def export_excel(self):
+        if not self.failed_tasks: return
+        default_name = f"下载失败清单_{int(time.time())}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "保存失败清单", default_name, "Excel Files (*.xlsx)")
+        if path:
+            try:
+                df = pd.DataFrame(self.failed_tasks)
+                cols_map = {'row_num': '原始行号', 'sheet': 'Sheet名', 'hook': 'Hook ID', 'name': '文件名',
+                            'url': '下载链接', 'error': '错误原因'}
+                available_cols = [c for c in cols_map.keys() if c in df.columns]
+                df = df[available_cols]
+                df.rename(columns=cols_map, inplace=True)
+                df.to_excel(path, index=False)
+                QMessageBox.information(self, "成功", f"清单已保存：\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+
+# === 1. 核心下载线程 ===
 class DownloadWorker(QThread):
-    log_signal = pyqtSignal(str)        
-    progress_signal = pyqtSignal(int)   
-    finished_signal = pyqtSignal(dict)  
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    file_progress_signal = pyqtSignal(str, int, int)
+    finished_signal = pyqtSignal(dict)
 
-    def __init__(self, tasks, base_save_dir, max_workers, retry_count=3, prevent_dupe=True, 
-                 folder_rule=None):
-        """
-        folder_rule: dict or None
-          {
-            "use_folder": True,
-            "col_value": "1920x1080_tab3...",
-            "delimiter": "_" (如果设为 None 则使用全部内容)
-          }
-        """
+    def __init__(self, tasks, save_root, max_workers, only_missing=False):
         super().__init__()
-        self.tasks = tasks 
-        self.base_save_dir = base_save_dir
+        self.tasks = tasks
+        self.save_root = save_root
         self.max_workers = max_workers
-        self.retry_count = retry_count
-        self.prevent_dupe = prevent_dupe
-        self.folder_rule = folder_rule
-        
-        self.is_running = True # 控制停止的标志位
-        self.total_tasks = len(tasks)
-        self.completed_count = 0
-        self.failed_tasks = []
+        self.only_missing = only_missing
+        self.is_running = True
 
     def stop(self):
-        """外部调用此方法来停止下载"""
         self.is_running = False
-        self.log_signal.emit("🛑 正在尝试停止所有任务...")
 
-    def run(self):
-        self.log_signal.emit(f"🚀 开始任务，共 {self.total_tasks} 个文件，线程数: {self.max_workers}")
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_task = {executor.submit(self.download_single, task): task for task in self.tasks}
-            
-            for future in as_completed(future_to_task):
-                # 1. 级检查：如果用户点了停止，就不再处理结果，直接退出循环
-                if not self.is_running:
-                    self.log_signal.emit("🚫 任务队列已终止。")
-                    break 
-                
-                task = future_to_task[future]
-                try:
-                    success, msg = future.result()
-                    if success:
-                        self.log_signal.emit(f"✅ 成功: {msg}")
-                    else:
-                        if "已停止" in msg: # 如果是手动停止的反馈
-                            self.log_signal.emit(f"⏹️ {msg}")
-                        else:
-                            self.log_signal.emit(f"❌ 失败: {msg}")
-                            self.failed_tasks.append(f"{task.get('name', '未知')}: {msg}")
-                except Exception as e:
-                    self.log_signal.emit(f"💥 异常: {str(e)}")
-                    self.failed_tasks.append(f"{task.get('url')}: {str(e)}")
-                
-                self.completed_count += 1
-                progress = int((self.completed_count / self.total_tasks) * 100)
-                self.progress_signal.emit(progress)
+    def get_url_hash(self, url):
+        if not isinstance(url, str): return "no_hash"
+        return hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
 
-        self.finished_signal.emit({
-            "total": self.total_tasks,
-            "failed": self.failed_tasks,
-            "stopped": not self.is_running
-        })
+    def clean_filename(self, filename):
+        s = str(filename)
+        if s.lower() == 'nan' or not s.strip(): return "未命名"
+        cleaned = re.sub(r'[\\/:*?"<>|]', '_', s)
+        cleaned = cleaned.replace('\n', '').replace('\r', '').strip()
 
-    def get_target_directory(self, task):
-        """计算文件应该存放在哪个文件夹"""
-        # 默认放在根目录
-        target_dir = self.base_save_dir
-        
-        # 如果启用了自动归档
-        if self.folder_rule and self.folder_rule.get('use_folder'):
-            raw_folder_str = str(task.get('folder_key', '')).strip()
-            
-            if raw_folder_str and raw_folder_str.lower() != 'nan':
-                folder_name = raw_folder_str
-                delimiter = self.folder_rule.get('delimiter')
-                
-                # 智能分割逻辑：比如 1920x1080_tab3，分隔符是 _，取第一部分
-                if delimiter and delimiter in folder_name:
-                    folder_name = folder_name.split(delimiter)[0]
-                
-                # 清理文件夹名中的非法字符
-                valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-                folder_name = ''.join(c for c in folder_name if c in valid_chars).strip()
-                
-                if folder_name:
-                    target_dir = os.path.join(self.base_save_dir, folder_name)
-                    # 自动创建文件夹
-                    try:
-                        os.makedirs(target_dir, exist_ok=True)
-                    except:
-                        pass # 创建失败回退到根目录
+        # 强制截断文件名，防止 Windows 路径溢出
+        if len(cleaned) > 80:
+            cleaned = cleaned[:80] + "..."
 
-        return target_dir
+        return cleaned if cleaned else "未命名"
+
+    def get_resolution_folder(self, file_path, file_type):
+        try:
+            w, h = 0, 0
+            if file_type == 'IMAGE':
+                with Image.open(file_path) as img:
+                    w, h = img.size
+            elif file_type == 'VIDEO':
+                cap = cv2.VideoCapture(file_path)
+                if cap.isOpened():
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH));
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+            if w > 0 and h > 0: return f"{w}x{h}"
+            return "未知尺寸"
+        except:
+            return "未知尺寸"
+
+    def check_if_exists(self, sheet, hook, url_hash):
+        target_base = os.path.join(self.save_root, sheet, hook)
+        if not os.path.exists(target_base): return False
+        for root, dirs, files in os.walk(target_base):
+            for f in files:
+                if f.startswith(url_hash + "_"): return True
+        return False
 
     def download_single(self, task):
-        # 2. 线程级检查：在开始每个任务前检查是否停止
-        if not self.is_running:
-            return False, "用户已停止任务"
+        if not self.is_running: return False, "用户停止"
+        url = task['url'];
+        sheet = task['sheet'];
+        hook = str(task['hook']).strip()
+        raw_name = task['name']
 
-        url = task['url']
-        custom_name = task.get('name')
-        
-        # 获取应该保存的目录（可能是子文件夹）
-        save_dir = self.get_target_directory(task)
+        if pd.isna(url) or not str(url).startswith('http'): return False, "无效链接"
+        url_hash = self.get_url_hash(url)
+        clean_name = self.clean_filename(raw_name)
 
-        if not url or not isinstance(url, str) or not url.startswith('http'):
-            return False, f"无效链接: {url}"
+        if self.only_missing:
+            if self.check_if_exists(sheet, hook, url_hash): return True, "已存在(跳过)"
 
-        headers = { 'User-Agent': 'Mozilla/5.0' }
+        temp_dir = os.path.join(self.save_root, "_temp_downloading")
+        if not os.path.exists(temp_dir): os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"temp_{url_hash}_{int(time.time() * 1000)}")
 
-        last_error = ""
-        for attempt in range(1, self.retry_count + 1):
-            if not self.is_running: return False, "用户已停止任务"
-            
+        success = False;
+        ext = ".bin";
+        file_type = "OTHER"
+
+        for _ in range(3):
+            if not self.is_running: return False, "用户停止"
             try:
-                with requests.get(url, headers=headers, stream=True, timeout=15) as response:
-                    response.raise_for_status()
-                    
-                    # 探测后缀
-                    content_type = response.headers.get('content-type', '')
-                    ext = mimetypes.guess_extension(content_type)
-                    if not ext:
-                        path = urlparse(url).path
-                        ext = os.path.splitext(path)[1]
-                    if not ext: ext = ".bin"
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+                with requests.get(url, headers=headers, stream=True, timeout=40) as r:
+                    r.raise_for_status()
+                    total_length = int(r.headers.get('content-length', 0))
+                    ct = r.headers.get('content-type', '')
+                    ge = mimetypes.guess_extension(ct)
+                    if ge: ext = ge
+                    if ext == ".bin" and '.' in url:
+                        ue = '.' + url.split('.')[-1].split('?')[0]
+                        if len(ue) < 10: ext = ue
+                    if 'image' in ct or ext.lower() in ['.jpg', '.png', '.jpeg', '.webp']:
+                        file_type = "IMAGE"
+                    elif 'video' in ct or ext.lower() in ['.mp4', '.mov', '.avi', '.mkv']:
+                        file_type = "VIDEO"
 
-                    # 确定文件名
-                    if custom_name:
-                        valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-                        clean_name = ''.join(c for c in str(custom_name) if c in valid_chars)
-                        filename = clean_name
-                    else:
-                        filename = os.path.basename(urlparse(url).path)
-                        if not filename: filename = f"file_{int(time.time())}"
-
-                    if not filename.endswith(ext): filename += ext
-
-                    # 防重名
-                    final_path = os.path.join(save_dir, filename)
-                    if os.path.exists(final_path) and self.prevent_dupe:
-                        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-                        name_part, ext_part = os.path.splitext(filename)
-                        final_path = os.path.join(save_dir, f"{name_part}_{random_str}{ext_part}")
-
-                    # 写入文件
-                    with open(final_path, 'wb') as f:
-                        # chunk_size=8192
-                        for chunk in response.iter_content(chunk_size=8192):
-                            # 3. 流级检查：每写入8KB检查一次，确保能秒停大文件
+                    downloaded = 0
+                    with open(temp_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=65536):
                             if not self.is_running:
-                                f.close()
-                                os.remove(final_path) # 删除下载了一半的残废文件
-                                return False, "下载中途被用户停止"
-                            
+                                f.close();
+                                if os.path.exists(temp_path): os.remove(temp_path)
+                                return False, "用户停止"
                             f.write(chunk)
-                    
-                    # 返回相对路径方便查看
-                    rel_path = os.path.relpath(final_path, self.base_save_dir)
-                    return True, f"{rel_path}"
+                            downloaded += len(chunk)
+                            self.file_progress_signal.emit(clean_name, downloaded, total_length)
+                    success = True;
+                    break
+            except:
+                time.sleep(1.5)
 
-            except Exception as e:
-                last_error = str(e)
-                if attempt < self.retry_count and self.is_running:
-                    time.sleep(1)
-                    continue
-        
-        return False, f"失败: {last_error}"
+        if not success:
+            if os.path.exists(temp_path): os.remove(temp_path)
+            return False, "下载失败(3次重试)"
+
+        # 0KB / 伪装网页检测
+        if os.path.exists(temp_path):
+            size = os.path.getsize(temp_path)
+            if size == 0:
+                os.remove(temp_path)
+                return False, "文件为空(0KB)"
+            if size < 10 * 1024:
+                try:
+                    with open(temp_path, 'rb') as f:
+                        header = f.read(50).lower()
+                        if b'<html' in header or b'<!doctype' in header or b'<body' in header or b'{' in header:
+                            f.close();
+                            os.remove(temp_path)
+                            return False, "链接失效(下载内容为网页或JSON)"
+                except:
+                    pass
+
+        try:
+            res_folder = self.get_resolution_folder(temp_path, file_type)
+            final_dir = os.path.join(self.save_root, sheet, hook, file_type, res_folder)
+            if not os.path.exists(final_dir): os.makedirs(final_dir)
+            final_name = f"{url_hash}_{clean_name}{ext}"
+            final_path = os.path.join(final_dir, final_name)
+            if os.path.exists(final_path): os.remove(final_path)
+            shutil.move(temp_path, final_path)
+            self.file_progress_signal.emit(clean_name, 100, 100)
+            return True, "成功"
+        except Exception as e:
+            if os.path.exists(temp_path): os.remove(temp_path)
+            return False, f"归档错误:{e}"
+
+    def run(self):
+        total = len(self.tasks)
+        completed = 0;
+        failed_list = [];
+        skipped_count = 0
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_task = {executor.submit(self.download_single, t): t for t in self.tasks}
+                for future in as_completed(future_to_task):
+                    if not self.is_running: break
+                    task = future_to_task[future]
+                    try:
+                        is_ok, msg = future.result()
+                        if is_ok:
+                            if "已存在" in msg:
+                                skipped_count += 1
+                            else:
+                                self.log_signal.emit(f"✅ {task['name']}")
+                        else:
+                            self.log_signal.emit(f"❌ {task['name']}: {msg}")
+                            task['error'] = msg
+                            failed_list.append(task)
+                    except Exception as e:
+                        self.log_signal.emit(f"❌ 系统异常: {str(e)}")
+                        task['error'] = str(e)
+                        failed_list.append(task)
+                    completed += 1
+                    self.progress_signal.emit(int(completed / total * 100))
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ 线程池异常: {e}")
+        finally:
+            if skipped_count > 0: self.log_signal.emit(f"⏭️ 智能跳过了 {skipped_count} 个已存在的文件")
+            self.finished_signal.emit({"failed": failed_list, "skipped": skipped_count})
 
 
-# --- 主界面 ---
+# === 主窗口 ===
 class DownloaderApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全能批量下载器 (Pro版)")
-        self.resize(950, 800)
-        
-        self.excel_df = None
-        self.save_path = os.getcwd()
+        self.setWindowTitle("全能素材归档下载器")
+        self.resize(1300, 950)
+        self.setAcceptDrops(True)
+
+        self.df_dict = {}
         self.worker = None
+        self.is_loading_hooks = False
+        self.active_downloads = {}
+
+        self.settings = QSettings("LoveToolbox", "Downloader")
 
         self.init_ui()
+        self.load_settings()
 
     def init_ui(self):
-        layout = QVBoxLayout()
+        main = QVBoxLayout()
+        main.setContentsMargins(10, 10, 10, 10);
+        main.setSpacing(5)
 
-        # 1. 模式选择
-        mode_group = QGroupBox("1. 基础配置")
-        mode_layout = QHBoxLayout()
-        self.rb_single = QRadioButton("单链接下载")
-        self.rb_batch = QRadioButton("Excel 批量下载")
-        self.rb_single.setChecked(True)
-        self.rb_single.toggled.connect(self.switch_mode)
-        self.rb_batch.toggled.connect(self.switch_mode)
-        mode_layout.addWidget(self.rb_single)
-        mode_layout.addWidget(self.rb_batch)
-        mode_group.setLayout(mode_layout)
-        layout.addWidget(mode_group)
+        font = QFont();
+        font.setPointSize(12)
+        if sys.platform == 'win32': font.setFamily("Microsoft YaHei")
 
-        # 2. 单链接区
-        self.single_input_widget = QWidget()
-        single_layout = QHBoxLayout()
-        self.line_url = QLineEdit()
-        self.line_url.setPlaceholderText("在此输入链接...")
-        single_layout.addWidget(QLabel("下载链接:"))
-        single_layout.addWidget(self.line_url)
-        self.single_input_widget.setLayout(single_layout)
-        layout.addWidget(self.single_input_widget)
+        header = QLabel("📖 流程：1.拖拽入表格 ➔ 2.选Sheet ➔ 3.设置列 ➔ 4.双栏选Hook ➔ 5.下载 (每次需手动选路径)")
+        header.setStyleSheet(
+            "background-color: #f5f5f5; color: #333; padding: 4px; border: 1px solid #ddd; border-radius: 4px; font-size: 12px;")
+        header.setFixedHeight(30);
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter);
+        main.addWidget(header)
 
-        # 3. Excel 批量区
-        self.batch_input_widget = QWidget()
-        self.batch_input_widget.hide()
-        batch_layout = QVBoxLayout()
-        
-        # 文件加载
-        file_row = QHBoxLayout()
-        self.btn_load_excel = QPushButton("📂 加载 Excel")
-        self.btn_load_excel.clicked.connect(self.load_excel)
-        self.lbl_excel_path = QLabel("未选择")
-        file_row.addWidget(self.btn_load_excel)
-        file_row.addWidget(self.lbl_excel_path)
-        batch_layout.addLayout(file_row)
-        
-        # 列映射
-        col_row = QHBoxLayout()
-        col_row.addWidget(QLabel("🔗 链接列:"))
-        self.combo_url_col = QComboBox()
-        col_row.addWidget(self.combo_url_col)
-        col_row.addSpacing(10)
-        col_row.addWidget(QLabel("📝 文件名列(可选):"))
-        self.combo_name_col = QComboBox()
-        col_row.addWidget(self.combo_name_col)
-        batch_layout.addLayout(col_row)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # === 新增：自动分类设置 ===
-        folder_group = QGroupBox("📂 自动归档/分类规则 (可选)")
-        folder_group.setStyleSheet("QGroupBox { border: 1px solid #aaa; margin-top: 10px; }")
-        folder_layout = QHBoxLayout()
-        
-        self.chk_auto_folder = QCheckBox("启用自动分类")
-        self.chk_auto_folder.setToolTip("开启后，将根据Excel某一列的内容自动创建子文件夹")
-        self.chk_auto_folder.toggled.connect(self.toggle_folder_ui)
-        
-        self.lbl_folder_col = QLabel("分类依据列:")
-        self.combo_folder_col = QComboBox()
-        self.combo_folder_col.setEnabled(False)
-        
-        self.lbl_delimiter = QLabel("分割规则:")
-        self.combo_delimiter = QComboBox()
-        self.combo_delimiter.addItems(["无 (使用整列内容)", "_ (下划线)", "- (横杠)", "空格", "| (竖线)"])
-        self.combo_delimiter.setEnabled(False)
-        self.combo_delimiter.setToolTip("例如：原内容为 '1920x1080_描述'，选择下划线规则后，文件夹名为 '1920x1080'")
+        left = QWidget();
+        ll = QVBoxLayout(left);
+        ll.setContentsMargins(0, 0, 0, 0)
+        self.g1 = QGroupBox("Step 1: 导入表格 (支持拖拽)");
+        self.g1.setMaximumHeight(80);
+        l1 = QVBoxLayout(self.g1);
+        l1.setContentsMargins(5, 5, 5, 5);
+        h1 = QHBoxLayout()
+        self.btn_load = QPushButton("📂 选择文件");
+        self.btn_load.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;")
+        self.btn_load.clicked.connect(self.select_file_dialog);
+        self.lbl_file = QLabel("未选择 (或直接拖入文件)");
+        h1.addWidget(self.btn_load);
+        h1.addWidget(self.lbl_file);
+        l1.addLayout(h1);
+        ll.addWidget(self.g1)
 
-        folder_layout.addWidget(self.chk_auto_folder)
-        folder_layout.addSpacing(20)
-        folder_layout.addWidget(self.lbl_folder_col)
-        folder_layout.addWidget(self.combo_folder_col)
-        folder_layout.addSpacing(20)
-        folder_layout.addWidget(self.lbl_delimiter)
-        folder_layout.addWidget(self.combo_delimiter)
-        folder_group.setLayout(folder_layout)
-        
-        batch_layout.addWidget(folder_group)
-        
-        self.batch_input_widget.setLayout(batch_layout)
-        layout.addWidget(self.batch_input_widget)
+        self.g2 = QGroupBox("Step 2: 选择 Sheet");
+        l2 = QVBoxLayout(self.g2);
+        l2.setContentsMargins(5, 5, 5, 5)
+        h_sheet_tools = QHBoxLayout()
+        self.search_sheet = QLineEdit();
+        self.search_sheet.setPlaceholderText("🔍 搜索...");
+        self.search_sheet.setClearButtonEnabled(True);
+        self.search_sheet.textChanged.connect(self.filter_sheets)
+        btn_sheet_all = QPushButton("全选");
+        btn_sheet_all.clicked.connect(lambda: self.batch_check_sheets(True))
+        btn_sheet_none = QPushButton("全不选");
+        btn_sheet_none.clicked.connect(lambda: self.batch_check_sheets(False))
+        h_sheet_tools.addWidget(self.search_sheet);
+        h_sheet_tools.addWidget(btn_sheet_all);
+        h_sheet_tools.addWidget(btn_sheet_none)
+        self.list_sheets = QListWidget();
+        self.list_sheets.itemChanged.connect(self.on_sheet_changed)
+        l2.addLayout(h_sheet_tools);
+        l2.addWidget(self.list_sheets);
+        ll.addWidget(self.g2, 1)
 
-        # 4. 设置区
-        settings_group = QGroupBox("2. 下载参数")
-        set_layout = QHBoxLayout()
-        
-        self.btn_save_dir = QPushButton("📂 保存位置")
-        self.btn_save_dir.clicked.connect(self.choose_save_dir)
-        self.lbl_save_dir = QLabel(self.save_path)
-        
-        set_layout.addWidget(self.btn_save_dir)
-        set_layout.addWidget(self.lbl_save_dir)
-        set_layout.addStretch()
-        
-        set_layout.addWidget(QLabel("线程:"))
-        self.slider_thread = QSlider(Qt.Orientation.Horizontal)
-        self.slider_thread.setRange(1, 16)
-        self.slider_thread.setValue(4)
-        self.slider_thread.setFixedWidth(100)
-        self.lbl_thread_val = QLabel("4")
-        self.slider_thread.valueChanged.connect(lambda v: self.lbl_thread_val.setText(str(v)))
-        set_layout.addWidget(self.slider_thread)
-        set_layout.addWidget(self.lbl_thread_val)
-        
-        set_layout.addSpacing(20)
-        self.chk_random = QCheckBox("防重名")
-        self.chk_random.setChecked(True)
-        set_layout.addWidget(self.chk_random)
-        
-        settings_group.setLayout(set_layout)
-        layout.addWidget(settings_group)
+        self.g3 = QGroupBox("Step 3: 设置列");
+        self.g3.setMaximumHeight(120);
+        l3 = QVBoxLayout(self.g3);
+        l3.setContentsMargins(5, 5, 5, 5)
+        h_hook = QHBoxLayout();
+        h_hook.addWidget(QLabel("🪝 Hook:"));
+        self.combo_hook = QComboBox();
+        self.combo_hook.currentIndexChanged.connect(self.refresh_hooks_and_stats);
+        h_hook.addWidget(self.combo_hook);
+        l3.addLayout(h_hook)
+        h_url = QHBoxLayout();
+        h_url.addWidget(QLabel("🔗 链接:"));
+        self.combo_url = QComboBox();
+        h_url.addWidget(self.combo_url);
+        l3.addLayout(h_url)
+        h_name = QHBoxLayout();
+        h_name.addWidget(QLabel("📝 名字:"));
+        self.combo_name = QComboBox();
+        h_name.addWidget(self.combo_name);
+        l3.addLayout(h_name)
+        ll.addWidget(self.g3);
+        splitter.addWidget(left)
 
-        # 5. 按钮区 (开始 & 停止)
-        btn_layout = QHBoxLayout()
-        
-        self.btn_start = QPushButton("🚀 开始下载")
-        self.btn_start.setFixedHeight(45)
-        self.btn_start.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold; font-size: 14px;")
-        self.btn_start.clicked.connect(self.start_download)
-        
-        self.btn_stop = QPushButton("🛑 立即停止")
-        self.btn_stop.setFixedHeight(45)
-        self.btn_stop.setStyleSheet("background-color: #d93025; color: white; font-weight: bold; font-size: 14px;")
-        self.btn_stop.clicked.connect(self.stop_download)
-        self.btn_stop.setEnabled(False) # 初始不可用
+        right = QWidget();
+        rl = QVBoxLayout(right);
+        rl.setContentsMargins(0, 0, 0, 0)
+        self.g4 = QGroupBox("Step 4: 筛选 Hook");
+        l4 = QHBoxLayout(self.g4);
+        l4.setContentsMargins(5, 5, 5, 5)
+        v_source = QVBoxLayout();
+        self.search_hook = QLineEdit();
+        self.search_hook.setPlaceholderText("🔍 待选...");
+        self.search_hook.setClearButtonEnabled(True);
+        self.search_hook.textChanged.connect(self.filter_hooks);
+        v_source.addWidget(self.search_hook)
+        h_tools = QHBoxLayout();
+        self.btn_all = QPushButton("全选");
+        self.btn_all.clicked.connect(lambda: self.batch_check_hooks(True));
+        self.btn_none = QPushButton("全不选");
+        self.btn_none.clicked.connect(lambda: self.batch_check_hooks(False))
+        h_tools.addWidget(self.btn_all);
+        h_tools.addWidget(self.btn_none);
+        v_source.addLayout(h_tools)
+        self.list_source = QListWidget();
+        self.list_source.itemChanged.connect(self.on_source_item_changed);
+        v_source.addWidget(self.list_source)
+        v_target = QVBoxLayout();
+        self.lbl_selected_count = QLabel("✅ 已选: 0");
+        self.lbl_selected_count.setStyleSheet("font-weight: bold; color: green;");
+        v_target.addWidget(self.lbl_selected_count)
+        self.list_target = QListWidget();
+        self.list_target.itemDoubleClicked.connect(self.on_target_double_click);
+        v_target.addWidget(self.list_target)
+        l4.addLayout(v_source, 1);
+        l4.addWidget(QLabel("👉"));
+        l4.addLayout(v_target, 1);
+        rl.addWidget(self.g4, 2)
 
-        btn_layout.addWidget(self.btn_start)
-        btn_layout.addWidget(self.btn_stop)
-        layout.addLayout(btn_layout)
+        self.g5 = QGroupBox("Step 5: 智能下载");
+        self.g5.setMaximumHeight(150);
+        l5 = QVBoxLayout(self.g5);
+        l5.setContentsMargins(5, 5, 5, 5)
+        hp = QHBoxLayout();
+        self.input_path = QLineEdit();
+        self.input_path.setPlaceholderText("请手动选择保存路径...");
+        self.input_path.setReadOnly(True);
+        self.btn_path = QPushButton("📂 浏览");
+        self.btn_path.clicked.connect(self.choose_path);
+        hp.addWidget(self.input_path);
+        hp.addWidget(self.btn_path);
+        l5.addLayout(hp)
+        ht = QHBoxLayout();
+        ht.addWidget(QLabel("线程数:"));
+        self.spin_thread = QSpinBox();
+        self.spin_thread.setRange(1, 16);
+        self.spin_thread.setValue(4);
+        ht.addWidget(self.spin_thread)
+        ht.addSpacing(20);
+        self.chk_overwrite = QCheckBox("强制覆盖已存在文件");
+        ht.addWidget(self.chk_overwrite);
+        ht.addStretch();
+        self.lbl_stats = QLabel("📊 实时统计: 0 个任务");
+        self.lbl_stats.setStyleSheet("font-weight: bold; color: #2e7d32; font-size: 13px;");
+        ht.addWidget(self.lbl_stats);
+        l5.addLayout(ht)
+        hb = QHBoxLayout();
+        self.btn_start = QPushButton("🚀 开始 / 继续");
+        self.btn_start.setFixedHeight(40);
+        self.btn_start.setStyleSheet("background-color: #2196f3; color: white; font-weight: bold;");
+        self.btn_start.clicked.connect(self.start_download_smart)
+        self.btn_retry = QPushButton("🔄 检查重试");
+        self.btn_retry.setFixedHeight(40);
+        self.btn_retry.setStyleSheet("background-color: #ff9800; color: white; font-weight: bold;");
+        self.btn_retry.clicked.connect(lambda: self.run_download(only_missing=True))
+        self.btn_stop = QPushButton("🛑 停止");
+        self.btn_stop.setFixedHeight(40);
+        self.btn_stop.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;");
+        self.btn_stop.clicked.connect(self.stop_download);
+        self.btn_stop.setEnabled(False);
+        hb.addWidget(self.btn_start);
+        hb.addWidget(self.btn_retry);
+        hb.addWidget(self.btn_stop);
+        l5.addLayout(hb);
+        rl.addWidget(self.g5)
+        splitter.addWidget(right);
+        main.addWidget(splitter)
 
-        # 6. 进度与日志
-        self.progress_bar = QProgressBar()
-        layout.addWidget(self.progress_bar)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("background-color: #222; color: #0f0; font-family: Consolas;")
-        layout.addWidget(self.log_text)
+        self.pbar = QProgressBar();
+        self.pbar.setValue(0);
+        main.addWidget(self.pbar)
+        lbl_monitor = QLabel("📡 实时传输监控台");
+        lbl_monitor.setStyleSheet("font-weight: bold; margin-top: 5px;");
+        main.addWidget(lbl_monitor)
+        self.table_active = QTableWidget();
+        self.table_active.setColumnCount(4);
+        self.table_active.setHorizontalHeaderLabels(["文件名", "进度", "已下载", "总大小"])
+        self.table_active.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table_active.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed);
+        self.table_active.setColumnWidth(1, 150)
+        self.table_active.setMaximumHeight(150);
+        main.addWidget(self.table_active)
+        lbl_log = QLabel("📜 运行日志");
+        lbl_log.setStyleSheet("font-weight: bold; margin-top: 5px;");
+        main.addWidget(lbl_log)
+        self.log_area = QTextEdit();
+        self.log_area.setMinimumHeight(120);
+        self.log_area.setReadOnly(True);
+        main.addWidget(self.log_area)
+        self.setLayout(main)
 
-        self.setLayout(layout)
+    def toggle_ui_state(self, enabled):
+        self.g1.setEnabled(enabled);
+        self.g2.setEnabled(enabled);
+        self.g3.setEnabled(enabled);
+        self.g4.setEnabled(enabled)
+        self.btn_path.setEnabled(enabled);
+        self.spin_thread.setEnabled(enabled);
+        self.chk_overwrite.setEnabled(enabled)
+        self.btn_start.setEnabled(enabled);
+        self.btn_retry.setEnabled(enabled);
+        self.btn_stop.setEnabled(not enabled)
 
-    # --- UI 交互逻辑 ---
-
-    def switch_mode(self):
-        if self.rb_single.isChecked():
-            self.single_input_widget.show()
-            self.batch_input_widget.hide()
+    def format_size(self, size_bytes):
+        limit_5mb = 5 * 1024 * 1024
+        if size_bytes < limit_5mb:
+            return f"{size_bytes / 1024:.1f} KB"
         else:
-            self.single_input_widget.hide()
-            self.batch_input_widget.show()
+            return f"{size_bytes / (1024 * 1024):.2f} MB"
 
-    def toggle_folder_ui(self, checked):
-        self.combo_folder_col.setEnabled(checked)
-        self.combo_delimiter.setEnabled(checked)
+    def update_active_progress(self, filename, downloaded, total):
+        if downloaded == 100 and total == 100:
+            if filename in self.active_downloads:
+                row = self.active_downloads[filename]
+                self.table_active.removeRow(row)
+                del self.active_downloads[filename]
+                self.active_downloads = {}
+                for r in range(self.table_active.rowCount()):
+                    fname_item = self.table_active.item(r, 0)
+                    if fname_item: self.active_downloads[fname_item.text()] = r
+            return
 
-    def choose_save_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择保存根目录")
-        if d:
-            self.save_path = d
-            self.lbl_save_dir.setText(d)
+        if filename not in self.active_downloads:
+            row = self.table_active.rowCount();
+            self.table_active.insertRow(row);
+            self.active_downloads[filename] = row
+            self.table_active.setItem(row, 0, QTableWidgetItem(filename))
+            pbar = QProgressBar();
+            pbar.setTextVisible(True);
+            self.table_active.setCellWidget(row, 1, pbar)
+            self.table_active.setItem(row, 2, QTableWidgetItem("0 KB"));
+            self.table_active.setItem(row, 3, QTableWidgetItem("计算中..."))
 
-    def load_excel(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "选择 Excel", "", "Excel Files (*.xlsx *.xls)")
-        if file_name:
-            try:
-                self.lbl_excel_path.setText(os.path.basename(file_name))
-                self.excel_df = pd.read_excel(file_name)
-                columns = self.excel_df.columns.tolist()
-                
-                # 填充所有下拉框
-                for combo in [self.combo_url_col, self.combo_name_col, self.combo_folder_col]:
-                    combo.clear()
-                    if combo == self.combo_name_col:
-                        combo.addItem("如果不选则自动命名")
-                    combo.addItems(columns)
-                
-                self.log(f"已加载 Excel，共 {len(self.excel_df)} 行数据")
-            except Exception as e:
-                QMessageBox.critical(self, "错误", f"读取失败: {str(e)}")
+        row = self.active_downloads[filename]
+        if total > 0:
+            pct = int((downloaded / total) * 100);
+            pbar = self.table_active.cellWidget(row, 1)
+            if pbar: pbar.setValue(pct)
+            self.table_active.item(row, 2).setText(self.format_size(downloaded))
+            self.table_active.item(row, 3).setText(self.format_size(total))
 
-    def start_download(self):
+    def load_settings(self):
+        self.spin_thread.setValue(self.settings.value("threads", 4, type=int))
+        self.chk_overwrite.setChecked(False)  # 默认不覆盖
+
+    def save_settings(self):
+        self.settings.setValue("threads", self.spin_thread.value())
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        files = [u.toLocalFile() for u in event.mimeData().urls()]
+        for f in files:
+            if f.lower().endswith(('.xlsx', '.xls', '.csv')): self.process_file(f); break
+
+    def select_file_dialog(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "选择表格", "", "Excel/CSV (*.xlsx *.xls *.csv)")
+        if fname: self.process_file(fname)
+
+    def process_file(self, fname):
+        self.lbl_file.setText(os.path.basename(fname));
+        self.df_dict = {}
+        try:
+            if fname.endswith('.csv'):
+                self.df_dict['CSV'] = pd.read_csv(fname)
+            else:
+                xls = pd.ExcelFile(fname)
+                for s in xls.sheet_names: self.df_dict[s] = pd.read_excel(fname, sheet_name=s)
+            self.list_sheets.clear()
+            for s in self.df_dict:
+                item = QListWidgetItem(s);
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable);
+                item.setCheckState(Qt.CheckState.Checked);
+                self.list_sheets.addItem(item)
+            df0 = list(self.df_dict.values())[0];
+            cols = [str(c) for c in df0.columns]
+            self.combo_hook.clear();
+            self.combo_hook.addItems(cols);
+            self.combo_url.clear();
+            self.combo_url.addItems(cols);
+            self.combo_name.clear();
+            self.combo_name.addItems(cols)
+            for i, c in enumerate(cols):
+                cl = c.lower()
+                if 'hook' in cl: self.combo_hook.setCurrentIndex(i)
+                if 'link' in cl or 'url' in cl: self.combo_url.setCurrentIndex(i)
+                if 'name' in cl: self.combo_name.setCurrentIndex(i)
+            self.refresh_hooks_and_stats()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"读取失败: {e}")
+
+    def sort_list_widget(self, list_widget):
+        list_widget.blockSignals(True)
+        items = []
+        for i in range(list_widget.count()): items.append(list_widget.takeItem(0))
+        items.sort(key=lambda x: (x.checkState() != Qt.CheckState.Checked, x.text()))
+        for it in items: list_widget.addItem(it)
+        list_widget.blockSignals(False)
+
+    def on_sheet_changed(self, item):
+        # Sheet 列表不再自动排序
+        filter_txt = self.search_sheet.text().lower()
+        if filter_txt: self.filter_sheets(filter_txt)
+        self.refresh_hooks_and_stats()
+
+    def batch_check_sheets(self, check):
+        self.list_sheets.blockSignals(True)
+        for i in range(self.list_sheets.count()):
+            it = self.list_sheets.item(i)
+            if check:
+                if not it.isHidden(): it.setCheckState(Qt.CheckState.Checked)
+            else:
+                it.setCheckState(Qt.CheckState.Unchecked)
+        self.list_sheets.blockSignals(False)
+        self.on_sheet_changed(None)
+
+    def on_source_item_changed(self, item):
+        self.sort_list_widget(self.list_source)  # Hook 列表依然自动置顶
+        filter_txt = self.search_hook.text().lower()
+        if filter_txt: self.filter_hooks(filter_txt)
+        self.update_task_stats()
+
+    def batch_check_hooks(self, check):
+        self.list_source.blockSignals(True)
+        for i in range(self.list_source.count()):
+            it = self.list_source.item(i)
+            if check:
+                if not it.isHidden(): it.setCheckState(Qt.CheckState.Checked)
+            else:
+                it.setCheckState(Qt.CheckState.Unchecked)
+        self.list_source.blockSignals(False)
+        self.on_source_item_changed(None)
+
+    def refresh_hooks_and_stats(self):
+        if not self.df_dict: return
+        self.is_loading_hooks = True
+        col = self.combo_hook.currentText()
+        if not col: return
+        all_hooks = set()
+        for i in range(self.list_sheets.count()):
+            it = self.list_sheets.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                s = it.text()
+                # 直接读取原始数据，不进行自动填充
+                if s in self.df_dict and col in self.df_dict[s].columns:
+                    all_hooks.update(self.df_dict[s][col].dropna().astype(str).unique())
+        self.list_source.blockSignals(True);
+        self.list_source.clear();
+        filter_txt = self.search_hook.text().lower()
+        for h in sorted(list(all_hooks)):
+            it = QListWidgetItem(h);
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable);
+            it.setCheckState(Qt.CheckState.Checked)
+            if filter_txt and filter_txt not in h.lower(): it.setHidden(True)
+            self.list_source.addItem(it)
+        self.list_source.blockSignals(False);
+        self.is_loading_hooks = False;
+        self.update_task_stats()
+
+    def on_target_double_click(self, item):
+        hook_text = item.text();
+        self.list_source.blockSignals(True)
+        items = self.list_source.findItems(hook_text, Qt.MatchFlag.MatchExactly)
+        if items: items[0].setCheckState(Qt.CheckState.Unchecked)
+        self.list_source.blockSignals(False);
+        self.on_source_item_changed(None)
+
+    def update_task_stats(self):
+        if self.is_loading_hooks or not self.df_dict: return
+        sel_sheets = [self.list_sheets.item(i).text() for i in range(self.list_sheets.count()) if
+                      self.list_sheets.item(i).checkState() == Qt.CheckState.Checked]
+        sel_hooks = set();
+        self.list_target.clear()
+        for i in range(self.list_source.count()):
+            it = self.list_source.item(i)
+            if it.checkState() == Qt.CheckState.Checked: txt = it.text(); sel_hooks.add(txt); self.list_target.addItem(
+                txt)
+        self.lbl_selected_count.setText(f"✅ 已选: {len(sel_hooks)}")
+        h_col = self.combo_hook.currentText();
+        total = 0
+        for s in sel_sheets:
+            df = self.df_dict[s]
+            if h_col in df.columns: total += df[h_col].astype(str).isin(sel_hooks).sum()
+        self.lbl_stats.setText(f"📊 实时统计: 选中 {len(sel_sheets)} 个表, {len(sel_hooks)} 个Hook, 共 {total} 个文件")
+
+    def filter_sheets(self, text):
+        for i in range(self.list_sheets.count()): it = self.list_sheets.item(i); it.setHidden(
+            text.lower() not in it.text().lower())
+
+    def filter_hooks(self, text):
+        for i in range(self.list_source.count()): it = self.list_source.item(i); it.setHidden(
+            text.lower() not in it.text().lower())
+
+    def choose_path(self):
+        d = QFileDialog.getExistingDirectory(self, "保存目录");
+        if d: self.input_path.setText(d)
+
+    def start_download_smart(self):
+        self.save_settings()
+        is_overwrite = self.chk_overwrite.isChecked()
+        self.run_download(only_missing=not is_overwrite)
+
+    def run_download(self, only_missing):
+        if not self.df_dict: return
+        root = self.input_path.text()
+        if not root: QMessageBox.warning(self, "提示", "请手动选择保存目录"); return
+        c_hook = self.combo_hook.currentText();
+        c_url = self.combo_url.currentText();
+        c_name = self.combo_name.currentText()
+        sel_hooks = set(self.list_source.item(i).text() for i in range(self.list_source.count()) if
+                        self.list_source.item(i).checkState() == Qt.CheckState.Checked)
         tasks = []
-        
-        # 1. 收集任务
-        if self.rb_single.isChecked():
-            url = self.line_url.text().strip()
-            if not url: return
-            tasks.append({"url": url, "name": None, "folder_key": None})
-        else:
-            if self.excel_df is None:
-                QMessageBox.warning(self, "提示", "请先加载 Excel")
-                return
-            
-            url_col = self.combo_url_col.currentText()
-            name_col = self.combo_name_col.currentText()
-            
-            # 获取分类列
-            use_folder = self.chk_auto_folder.isChecked()
-            folder_col = self.combo_folder_col.currentText() if use_folder else None
-            
-            for index, row in self.excel_df.iterrows():
-                u = str(row[url_col]).strip()
-                if u and u.lower() != 'nan':
-                    n = str(row[name_col]).strip() if name_col != "如果不选则自动命名" else None
-                    # 获取分类的原始文本 (比如 "1920x1080_tab3")
-                    f_key = str(row[folder_col]).strip() if use_folder else None
-                    
-                    tasks.append({
-                        "url": u, 
-                        "name": n,
-                        "folder_key": f_key
-                    })
+        for i in range(self.list_sheets.count()):
+            it = self.list_sheets.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                s = it.text();
+                df = self.df_dict[s]
+                for idx, row in df.iterrows():
+                    h = str(row[c_hook]).strip()
+                    if h in sel_hooks:
+                        n = str(row[c_name]) if c_name and not pd.isna(row[c_name]) else "未命名"
+                        tasks.append({
+                            "sheet": s, "hook": h, "url": row[c_url], "name": n,
+                            "row_num": idx + 2
+                        })
+        if not tasks: QMessageBox.warning(self, "提示", "没有任务"); return
+        if self.worker is not None and self.worker.isRunning(): QMessageBox.warning(self, "提示",
+                                                                                    "任务停止中..."); return
 
-        if not tasks: return
+        self.toggle_ui_state(False)
+        self.log_area.clear();
+        self.log_area.append(f"🚀 开始任务: {len(tasks)}个")
+        self.pbar.setValue(0)
+        self.table_active.setRowCount(0);
+        self.active_downloads = {}
 
-        # 2. 获取分类规则
-        folder_rule = None
-        if self.chk_auto_folder.isChecked():
-            delimiter_map = {
-                "无 (使用整列内容)": None,
-                "_ (下划线)": "_",
-                "- (横杠)": "-",
-                "空格": " ",
-                "| (竖线)": "|"
-            }
-            sel_del = self.combo_delimiter.currentText()
-            folder_rule = {
-                "use_folder": True,
-                "delimiter": delimiter_map.get(sel_del)
-            }
-
-        # 3. UI 状态切换
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True) # 启用停止按钮
-        self.progress_bar.setValue(0)
-        self.log_text.clear()
-        
-        # 4. 启动线程
-        self.worker = DownloadWorker(
-            tasks, self.save_path, self.slider_thread.value(), 
-            prevent_dupe=self.chk_random.isChecked(),
-            folder_rule=folder_rule
-        )
-        self.worker.log_signal.connect(self.log)
-        self.worker.progress_signal.connect(self.update_progress)
+        self.worker = DownloadWorker(tasks, root, self.spin_thread.value(), only_missing=only_missing)
+        self.worker.log_signal.connect(self.log_area.append)
+        self.worker.progress_signal.connect(self.pbar.setValue)
+        self.worker.file_progress_signal.connect(self.update_active_progress)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
 
     def stop_download(self):
-        if self.worker and self.worker.isRunning():
-            self.btn_stop.setEnabled(False)
-            self.btn_stop.setText("正在停止...")
-            self.worker.stop() # 发送停止信号
-
-    def log(self, msg):
-        self.log_text.append(msg)
-        sb = self.log_text.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def update_progress(self, val):
-        self.progress_bar.setValue(val)
+        if self.worker: self.worker.stop(); self.log_area.append("🛑 正在停止...")
 
     def on_finished(self, report):
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.setText("🛑 立即停止")
-        
-        if report.get('stopped'):
-            self.log("⚠️ 任务已被用户强制停止。")
-            QMessageBox.information(self, "已停止", "下载任务已停止。部分文件可能已下载完成。")
-        else:
-            failed = report.get('failed', [])
-            if failed:
-                QMessageBox.warning(self, "完成但有错误", f"失败 {len(failed)} 个，详见日志")
-            else:
-                QMessageBox.information(self, "成功", "全部下载完成！")
+        self.toggle_ui_state(True)
+        self.pbar.setValue(100)
+        self.table_active.setRowCount(0);
+        self.active_downloads = {}
+
+        failed = report['failed'];
+        skipped = report.get('skipped', 0)
+        msg = f"处理完成！\n跳过: {skipped}\n失败: {len(failed)}"
+        QMessageBox.information(self, "下载完成", msg)
+
+        if failed:
+            ErrorReportDialog(failed, self).exec()
+
 
 if __name__ == "__main__":
-    from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     win = DownloaderApp()
     win.show()
