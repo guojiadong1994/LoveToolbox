@@ -1,16 +1,21 @@
-name: Build and Release
+name: Build and Release Multi-Platform
 
 on:
   push:
     tags:
-      - 'v*' # 只有当你打标签（如 v1.0, v1.1）时才触发发布，平时提交代码不触发
+      - 'v*' # 只有打标签 v1.0, v1.1 时触发
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # 同时启动 Windows 和 macOS 任务
+        os: [windows-latest, macos-latest]
 
     steps:
     - uses: actions/checkout@v4
@@ -22,18 +27,38 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        pip install -r requirements.txt
-        pip install requests # 确保安装 requests，更新功能需要它
+        pip install -r LoveToolbox/requirements.txt
+        pip install requests
 
-    - name: Build EXE
+    # --- Windows 打包逻辑 ---
+    - name: Build Windows EXE
+      if: runner.os == 'Windows'
       run: |
-        # 注意：这里把名字固定为 LoveToolbox.exe，方便更新脚本识别
-        pyinstaller --name="LoveToolbox" --windowed --onefile --clean --noconfirm main.py
+        # 进入目录
+        cd LoveToolbox
+        # 打包，指定名字带上系统标识
+        pyinstaller --name="LoveToolbox-Windows" --windowed --onefile --clean --noconfirm main.py
 
+    # --- macOS 打包逻辑 ---
+    - name: Build macOS App
+      if: runner.os == 'macOS'
+      run: |
+        cd LoveToolbox
+        # Mac下打包为 .app 文件夹
+        pyinstaller --name="LoveToolbox" --windowed --clean --noconfirm main.py
+        
+        # 将 .app 压缩为 .zip (Mac下分发通常用zip，方便下载和更新)
+        cd dist
+        zip -r LoveToolbox-macOS.zip LoveToolbox.app
+
+    # --- 上传发布文件 ---
     - name: Release to GitHub
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: dist/LoveToolbox.exe
+        # Windows 上传 exe，Mac 上传 zip
+        files: |
+          LoveToolbox/dist/LoveToolbox-Windows.exe
+          LoveToolbox/dist/LoveToolbox-macOS.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
