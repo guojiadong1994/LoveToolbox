@@ -34,8 +34,6 @@ jobs:
     - name: Build Windows EXE
       if: runner.os == 'Windows'
       run: |
-        # 进入目录
-        cd LoveToolbox
         # 打包，指定名字带上系统标识
         pyinstaller --name="LoveToolbox-Windows" --windowed --onefile --clean --noconfirm main.py
 
@@ -43,7 +41,6 @@ jobs:
     - name: Build macOS App
       if: runner.os == 'macOS'
       run: |
-        cd LoveToolbox
         # Mac下打包为 .app 文件夹
         pyinstaller --name="LoveToolbox" --windowed --clean --noconfirm main.py
         
