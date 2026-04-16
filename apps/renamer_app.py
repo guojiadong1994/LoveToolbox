@@ -33,7 +33,7 @@ class RenamerWorker(QThread):
             folder_name = os.path.basename(root)
             # 只要这个文件夹在 map 的 key 里（说明用户勾选了），就算任务
             if folder_name in self.prefix_map:
-                 valid = [f for f in files if not f.startswith('.')]
+                 valid = [f for f in files if not f.startswith('.') and f.lower() != 'thumbs.db']
                  total_files += len(valid)
         
         if total_files == 0:
@@ -49,9 +49,9 @@ class RenamerWorker(QThread):
             
             folder_name = os.path.basename(root)
             
-            valid_files = [f for f in files if not f.startswith('.')]
+            valid_files = [f for f in files if not f.startswith('.') and f.lower() != 'thumbs.db']
             if not valid_files:
-                continue 
+                continue
             
             # 构建目标路径
             rel_path = os.path.relpath(root, self.source_dir)
@@ -241,7 +241,7 @@ class RenamerApp(QWidget):
         unique_folders = set()
         
         for root, dirs, files in os.walk(self.source_path):
-            valid_files = [f for f in files if not f.startswith('.')]
+            valid_files = [f for f in files if not f.startswith('.') and f.lower() != 'thumbs.db']
             if valid_files:
                 folder_name = os.path.basename(root)
                 unique_folders.add(folder_name)

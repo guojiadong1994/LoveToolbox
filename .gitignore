@@ -1,0 +1,13 @@
+# Object file
+*.o
+
+# Ada Library Information
+*.ali
+bin
+models-ext
+models
+models-xx
+*.zip
+tools
+*.DS_Store
+apps/*.DS_Store
