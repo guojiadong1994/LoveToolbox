@@ -11,6 +11,7 @@ from apps.video_sorter_app import VideoSorterApp  # 视频分类
 from apps.renamer_app import RenamerApp  # 分组重命名
 from apps.image_sorter_app import ImageSorterApp  # 图片分拣
 from apps.downloader_app import DownloaderApp  # ⬇️ 新增：全能素材归档下载器
+from apps.link_checker_app import LinkCheckerApp
 
 # 导入更新模块
 from apps.updater import check_update, CURRENT_VERSION
@@ -22,7 +23,7 @@ class LauncherWindow(QMainWindow):
         self.setWindowTitle(f"运营素材归档工作台 {CURRENT_VERSION}")
 
         # 窗口大小
-        self.resize(700, 500)
+        self.resize(700, 620)
 
         # 主容器
         central_widget = QWidget()
@@ -76,6 +77,8 @@ class LauncherWindow(QMainWindow):
 
         # 👇 压轴神器：高亮显示
         self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 1, is_special=True)
+        # Row 2: 链接检测
+        self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 2, 0)
 
     def add_app_icon(self, text, callback, row, col, is_special=False):
         btn = QPushButton(text)
@@ -133,6 +136,10 @@ class LauncherWindow(QMainWindow):
         # 启动刚才写好的新下载器
         self.downloader_window = DownloaderApp()
         self.downloader_window.show()
+
+    def open_link_checker_app(self):
+        self.link_checker_window = LinkCheckerApp()
+        self.link_checker_window.show()
 
 
 if __name__ == "__main__":
