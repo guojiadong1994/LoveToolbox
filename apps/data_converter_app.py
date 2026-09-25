@@ -263,9 +263,10 @@ class DataConverterApp(QWidget):
             QMessageBox.warning(self, "错误", str(e))
 
     def add_task_item(self, task_name):
-        item = QListWidgetItem(self.task_list)
+        item = QListWidgetItem()
         item.setSizeHint(self.task_row_size())
         item.setCheckState(Qt.CheckState.Checked)
+        item.setData(Qt.ItemDataRole.UserRole, task_name)
 
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -328,7 +329,11 @@ class DataConverterApp(QWidget):
             QMessageBox.warning(self, "提示", "请选择保存目录")
             return
 
-        tasks = [self.task_list.item(i).text() for i in range(self.task_list.count()) if self.task_list.item(i).checkState() == Qt.CheckState.Checked]
+        tasks = [
+            self.task_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.task_list.count())
+            if self.task_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
         fields = [self.selected_fields.item(i).text() for i in range(self.selected_fields.count())]
 
         self.worker = DataConvertWorker(self.file_path, save, getattr(self, "date_value", ""), tasks, fields)
