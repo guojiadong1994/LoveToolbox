@@ -61,6 +61,7 @@ class LauncherWindow(QMainWindow):
         self.add_app_icon("🔢\n分组重命名", self.open_renamer_app, 1, 0)
         self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 1, is_special=True)
         self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 2, 0)
+        self.add_app_icon("📊\n转换数据", self.open_data_converter_app, 2, 1)
 
     def add_app_icon(self, text, callback, row, col, is_special=False):
         btn = QPushButton(text)
@@ -122,6 +123,11 @@ class LauncherWindow(QMainWindow):
         from apps.link_checker_app import LinkCheckerApp
         self.link_checker_window = LinkCheckerApp()
         self.link_checker_window.show()
+
+    def open_data_converter_app(self):
+        from apps.data_converter_app import DataConverterApp
+        self.data_converter_window = DataConverterApp()
+        self.data_converter_window.show()
 
 
 if __name__ == "__main__":
