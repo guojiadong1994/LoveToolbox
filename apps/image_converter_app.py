@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PyQt6.QtGui import QCursor, QDragEnterEvent, QDropEvent, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -560,7 +560,25 @@ class ImageConverterApp(QWidget):
         self.worker = None
         self._syncing_size_controls = False
         self.target_size_kb = 500.0
+        self._centered_once = False
         self.init_ui()
+
+    def showEvent(self, event):
+        """首次打开时居中到用户当前所在屏幕，避免窗口出现在左上角。"""
+        super().showEvent(event)
+        if self._centered_once:
+            return
+
+        screen = QApplication.screenAt(QCursor.pos())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.availableGeometry().center())
+        self.move(frame.topLeft())
+        self._centered_once = True
 
     def init_ui(self):
         self.setStyleSheet(
