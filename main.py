@@ -56,12 +56,15 @@ class LauncherWindow(QMainWindow):
         self.init_apps()
 
     def init_apps(self):
+        # 首页采用 3 列布局：每排 3 个工具
         self.add_app_icon("🎬\n视频分类器", self.open_sorter_app, 0, 0)
         self.add_app_icon("📂\n图片分拣器", self.open_image_sorter_app, 0, 1)
-        self.add_app_icon("🔢\n分组重命名", self.open_renamer_app, 1, 0)
-        self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 1, is_special=True)
-        self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 2, 0)
-        self.add_app_icon("📊\n转换数据", self.open_data_converter_app, 2, 1)
+        self.add_app_icon("🔢\n分组重命名", self.open_renamer_app, 0, 2)
+
+        self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 0, is_special=True)
+        self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 1, 1)
+        self.add_app_icon("📊\n转换数据", self.open_data_converter_app, 1, 2)
+        self.add_app_icon("🖼️\n图片转换", self.open_image_converter_app, 2, 0)
 
     def add_app_icon(self, text, callback, row, col, is_special=False):
         btn = QPushButton(text)
@@ -128,6 +131,11 @@ class LauncherWindow(QMainWindow):
         from apps.data_converter_app import DataConverterApp
         self.data_converter_window = DataConverterApp()
         self.data_converter_window.show()
+
+    def open_image_converter_app(self):
+        from apps.image_converter_app import ImageConverterApp
+        self.image_converter_window = ImageConverterApp()
+        self.image_converter_window.show()
 
 
 if __name__ == "__main__":
