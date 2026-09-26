@@ -1,5 +1,4 @@
 import sys
-import time
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -10,10 +9,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
-    QSplashScreen,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QPixmap
 
 
 # 当前版本号（仅用于显示，不再提供远程更新）
@@ -24,7 +21,6 @@ class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"运营素材归档工作台 {CURRENT_VERSION}")
-
         self.resize(700, 620)
 
         central_widget = QWidget()
@@ -34,7 +30,12 @@ class LauncherWindow(QMainWindow):
         self.grid_layout.setSpacing(25)
 
         title = QLabel("🚀 今天要开心呀！")
-        title.setFont(QFont("Microsoft YaHei", 20, QFont.Weight.Bold))
+        # 使用系统默认字体，只调整字号/粗细。
+        # 避免 macOS 启动时额外查找 Windows 专属字体 Microsoft YaHei。
+        title_font = title.font()
+        title_font.setPointSize(20)
+        title_font.setBold(True)
+        title.setFont(title_font)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("color: #333; margin-bottom: 20px; margin-top: 10px;")
 
@@ -49,7 +50,6 @@ class LauncherWindow(QMainWindow):
 
         bottom_layout.addWidget(self.lbl_version)
         bottom_layout.addStretch()
-
         main_layout.addLayout(bottom_layout)
 
         central_widget.setLayout(main_layout)
@@ -69,7 +69,11 @@ class LauncherWindow(QMainWindow):
     def add_app_icon(self, text, callback, row, col, is_special=False):
         btn = QPushButton(text)
         btn.setFixedSize(140, 140)
-        btn.setFont(QFont("Microsoft YaHei", 12))
+
+        # 保留系统字体，只设置字号，减少跨平台字体回退/别名扫描。
+        btn_font = btn.font()
+        btn_font.setPointSize(12)
+        btn.setFont(btn_font)
 
         if is_special:
             style = """
@@ -140,24 +144,10 @@ class LauncherWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
 
-    # 启动画面，避免首次加载时空白等待
-    splash_pix = QPixmap(400, 250)
-    splash_pix.fill(Qt.GlobalColor.white)
-    splash = QSplashScreen(splash_pix)
-    splash.showMessage(
-        "LoveToolbox\n\n正在启动...",
-        Qt.AlignmentFlag.AlignCenter,
-        Qt.GlobalColor.darkGray,
-    )
-    splash.show()
-    app.processEvents()
-
-    time.sleep(0.3)
-
+    # 不再强制 Fusion 样式，也不再创建 Splash / 人为 sleep。
+    # 直接使用系统原生 Qt 样式并尽快显示首页。
     window = LauncherWindow()
     window.show()
-    splash.finish(window)
 
     sys.exit(app.exec())
