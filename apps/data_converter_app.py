@@ -29,6 +29,69 @@ CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".lovetoolbox")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "data_converter_config.json")
 
 
+def read_source_excel(file_path, header):
+    """读取底表，并尽量保留任务列中的 Excel 特殊值（例如 #N/A）。"""
+    df = pd.read_excel(file_path, header=header, keep_default_na=False)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "任务" not in df.columns:
+        return df
+
+    try:
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb.active
+        header_row = header + 1
+        raw_header = next(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True))
+        header_values = [str(value).strip() if value is not None else "" for value in raw_header]
+        task_col = header_values.index("任务") + 1
+
+        first_data_row = header + 2
+        last_data_row = first_data_row + len(df) - 1
+        raw_tasks = [
+            row[0]
+            for row in ws.iter_rows(
+                min_row=first_data_row,
+                max_row=last_data_row,
+                min_col=task_col,
+                max_col=task_col,
+                values_only=True,
+            )
+        ]
+
+        restored_tasks = []
+        for current, raw_value in zip(df["任务"].tolist(), raw_tasks):
+            if raw_value is None:
+                restored_tasks.append("" if pd.isna(current) else str(current))
+            else:
+                restored_tasks.append(str(raw_value))
+        df["任务"] = restored_tasks
+    except Exception:
+        # 恢复特殊值失败时仍使用 pandas 已读取的数据，不影响主流程。
+        df["任务"] = df["任务"].apply(lambda v: "" if pd.isna(v) else str(v))
+
+    return df
+
+
+def safe_task_filename(task_name):
+    """将任务名转换为跨 Windows/macOS 可用的文件名，同时尽量保持原样。"""
+    replacements = {
+        "/": "／",
+        "\\": "＼",
+        ":": "：",
+        "*": "＊",
+        "?": "？",
+        '"': "＂",
+        "<": "＜",
+        ">": "＞",
+        "|": "｜",
+    }
+    name = str(task_name)
+    for src, dst in replacements.items():
+        name = name.replace(src, dst)
+    name = name.strip().rstrip(".")
+    return name or "空任务"
+
+
 class DataConvertWorker(QThread):
     progress = pyqtSignal(int, str)
     finished_signal = pyqtSignal(str)
@@ -73,8 +136,7 @@ class DataConvertWorker(QThread):
             if header is None:
                 raise Exception("无法识别表头")
 
-            df = pd.read_excel(self.file_path, header=header, keep_default_na=False)
-            df.columns = [str(c).strip() for c in df.columns]
+            df = read_source_excel(self.file_path, header)
 
             df = df.dropna(how="all")
 
@@ -91,7 +153,11 @@ class DataConvertWorker(QThread):
             output = os.path.join(self.save_dir, self.date_value)
             os.makedirs(output, exist_ok=True)
 
-            tasks = self.tasks or sorted(df["任务"].unique())
+            # 任务必须来自当前日期筛选后的数据，不能回退到整张表。
+            available_tasks = set(df["任务"].astype(str).unique())
+            tasks = [str(task) for task in self.tasks if str(task) in available_tasks]
+            if not tasks:
+                raise Exception("当前日期下没有选中的任务，请至少选择一个任务")
 
             for index, task in enumerate(tasks):
                 self.progress.emit(
@@ -108,7 +174,8 @@ class DataConvertWorker(QThread):
                     continue
 
                 result = part[cols]
-                path = os.path.join(output, f"{task}消耗上传模版.xlsx")
+                file_task = safe_task_filename(task)
+                path = os.path.join(output, f"{file_task}消耗上传模版.xlsx")
 
                 result.to_excel(path, index=False)
                 self.format_excel(path)
@@ -130,6 +197,7 @@ class DataConverterApp(QWidget):
         self.file_path = ""
         self.last_output = ""
         self.worker = None
+        self.source_df = None
         self.config = self.load_config()
 
         self.init_ui()
@@ -242,20 +310,25 @@ class DataConverterApp(QWidget):
             return
         try:
             header = self.find_header(path)
-            df = pd.read_excel(path, header=header, keep_default_na=False)
-            df.columns = [str(c).strip() for c in df.columns]
+            df = read_source_excel(path, header)
             self.file_path = path
             self.file_label.setText(path)
 
-            dates = sorted(df["日期"].astype(str).unique(), reverse=True)
+            # 缓存当前底表，后续切换日期时直接从内存刷新任务，避免重复读取 Excel。
+            df["日期"] = df["日期"].astype(str)
+            df["任务"] = df["任务"].astype(str)
+            self.source_df = df
+
+            dates = sorted(df["日期"].unique(), reverse=True)
+            self.date_box.blockSignals(True)
             self.date_box.clear()
             self.date_box.addItems(dates)
-            self.date_value = dates[0] if dates else ""
+            self.date_box.blockSignals(False)
 
-            self.task_list.clear()
-            # 保留所有任务，包括 #N/A 等特殊值，并增加单独复制按钮
-            for t in sorted(df["任务"].astype(str).unique()):
-                self.add_task_item(t)
+            self.date_value = dates[0] if dates else ""
+            if self.date_value:
+                self.date_box.setCurrentText(self.date_value)
+            self.refresh_tasks_for_date(self.date_value)
 
             self.init_fields(list(df.columns))
 
@@ -295,6 +368,23 @@ class DataConverterApp(QWidget):
 
     def change_date(self, value):
         self.date_value = value
+        self.refresh_tasks_for_date(value)
+
+    def refresh_tasks_for_date(self, date_value):
+        """只显示当前日期下实际存在的任务分类。"""
+        self.task_list.clear()
+        if self.source_df is None or not date_value:
+            return
+
+        day_df = self.source_df[self.source_df["日期"] == str(date_value)]
+        if day_df.empty:
+            return
+
+        # keep_default_na=False 已确保 #N/A 等文本不会被 pandas 当作缺失值。
+        # 使用字符串排序，保留当前日期下的全部唯一任务值。
+        tasks = sorted(day_df["任务"].astype(str).unique())
+        for task in tasks:
+            self.add_task_item(task)
 
     def init_fields(self, columns):
         self.selected_fields.clear()
@@ -334,9 +424,21 @@ class DataConverterApp(QWidget):
             for i in range(self.task_list.count())
             if self.task_list.item(i).checkState() == Qt.CheckState.Checked
         ]
-        fields = [self.selected_fields.item(i).text() for i in range(self.selected_fields.count())]
+        if not tasks:
+            QMessageBox.warning(self, "提示", "请至少选择一个当前日期下的任务")
+            return
 
-        self.worker = DataConvertWorker(self.file_path, save, getattr(self, "date_value", ""), tasks, fields)
+        fields = [self.selected_fields.item(i).text() for i in range(self.selected_fields.count())]
+        if not fields:
+            QMessageBox.warning(self, "提示", "请至少选择一个输出字段")
+            return
+
+        date_value = getattr(self, "date_value", "")
+        if not date_value:
+            QMessageBox.warning(self, "提示", "请选择日期")
+            return
+
+        self.worker = DataConvertWorker(self.file_path, save, date_value, tasks, fields)
         self.worker.progress.connect(lambda p,t: (self.progress.setValue(p), self.status.setText(t)))
         self.worker.finished_signal.connect(self.done)
         self.worker.error_signal.connect(lambda x: QMessageBox.warning(self,"错误",x))
