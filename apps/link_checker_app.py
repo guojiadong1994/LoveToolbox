@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LoveToolbox 链接检测：六输入框 / 单文件 / 精简规则。
+"""LoveToolbox 链接检测：六输入框 / 支持任意完整链接对 / 精简规则。
 
 仅检查：链接基本类型/格式、vivo 渠道及曝光点击渠道一致、
 字段前后变化、曝光点击 partnerId 删除与必须修改、HK 变化、三链接 taskId 对应。
@@ -214,13 +214,18 @@ class LinkAuditEngine:
 
     def audit(self, links):
         self.findings = []
-        for kind in LINK_TYPES:
+        active = [kind for kind in LINK_TYPES
+                  if links.get(f"old_{kind}", "").strip()
+                  and links.get(f"new_{kind}", "").strip()]
+        if not active:
+            return self.findings
+        for kind in active:
             before, after = links.get(f"old_{kind}", "").strip(), links.get(f"new_{kind}", "").strip()
             self._compare(before, after, kind)
             self._basic(before, after, kind)
             self._check_required_edit(before, after, kind)
-        self._check_channels(links)
-        self._check_taskid(links)
+        self._check_channels(links, active)
+        self._check_taskid(links, active)
         return self.findings
 
     def _basic(self, before, after, kind):
@@ -281,7 +286,7 @@ class LinkAuditEngine:
         # If source had no partnerId, don't claim it *had* to be removed;
         # extra fields still show as ordinary red changes.
 
-    def _check_channels(self, links):
+    def _check_channels(self, links, active):
         """Identify Vivo and check exposure/click requestFrom + optional media.
 
         One error per channel root cause, not one per inner business field.
@@ -290,7 +295,7 @@ class LinkAuditEngine:
         must still be reported.
         """
         values = {}
-        for kind in LINK_TYPES:
+        for kind in active:
             before, after = links.get(f"old_{kind}", ""), links.get(f"new_{kind}", "")
             old_req, old_media = _channel_fields(before)
             new_req, new_media = _channel_fields(after)
@@ -313,16 +318,20 @@ class LinkAuditEngine:
             else:
                 self._add(kind, "error", "vivo 渠道异常", show(old_signal), show(new_signal), msg)
 
-        old_exp, old_click = values["exp"], values["click"]
+        old_exp, old_click = values.get("exp"), values.get("click")
         def one(xs):
             return xs[0] if len(xs) == 1 else None
-        before_exp, after_exp = one(old_exp[0]), one(old_exp[2])
-        before_click, after_click = one(old_click[0]), one(old_click[2])
+        before_exp = one(old_exp[0]) if old_exp else None
+        after_exp = one(old_exp[2]) if old_exp else None
+        before_click = one(old_click[0]) if old_click else None
+        after_click = one(old_click[2]) if old_click else None
         # A missing requestFrom is already covered by the basic Vivo check;
         # avoid another alert with the same cause.
         different_requests = (after_exp is not None and after_click is not None and after_exp != after_click)
         media_issues = []
         for kind, data in (("exp", old_exp), ("click", old_click)):
+            if data is None:
+                continue
             req, media = one(data[2]), one(data[3])
             if req is not None and media is not None and req != media:
                 media_issues.append((kind, req, media))
@@ -544,11 +553,16 @@ class LinkAuditEngine:
                 self._add(kind, "error", "内层字段新增", "（不存在）", _display(f"{prefix} → {b['name']}", b["values"]),
                           "内层新增字段，请核对。", change=True)
 
-    def _check_taskid(self, links):
-        old = {kind: _task_id(links.get(f"old_{kind}", "")) for kind in LINK_TYPES}
-        new = {kind: _task_id(links.get(f"new_{kind}", "")) for kind in LINK_TYPES}
+    def _check_taskid(self, links, active):
+        # 单组不做跨组关联检测；两组或三组才比对 taskId。
+        if len(active) < 2:
+            return
+        old = {kind: _task_id(links.get(f"old_{kind}", "")) for kind in active}
+        new = {kind: _task_id(links.get(f"new_{kind}", "")) for kind in active}
         def aligned(v):
-            return all(len(v[k]) == 1 for k in LINK_TYPES) and len({v[k][0] for k in LINK_TYPES}) == 1
+            return all(len(v[k]) == 1 for k in active) and len({v[k][0] for k in active}) == 1
+        scope = "、".join(_type_label(k) for k in active)
+        label = f"{len(active)}组链接"
         if aligned(new):
             return
         # A single taskId edit can be the reason for an association mismatch;
@@ -556,13 +570,13 @@ class LinkAuditEngine:
         matching = [f for f in self.findings if f.change and "taskid" in (f.before + f.after).lower()]
         if matching:
             for f in matching:
-                f.detail += " 修改后三条链接的 taskId 不一致，请确认是否串用了其他任务的链接。"
+                f.detail += f" 修改后已填写的链接组（{scope}）taskId 不一致，请确认是否串用了其他任务的链接。"
                 f.status = "error"
             return
         def show(d):
-            return "；".join(f"{_type_label(k)}：{','.join(d[k]) if d[k] else '缺失'}" for k in LINK_TYPES)
-        self._add("曝光/点击/DP", "error", "三链接 taskId 不一致", show(old), show(new),
-                  "修改后三条链接的 taskId 缺失或不一致，请确认属于同一任务。")
+            return "；".join(f"{_type_label(k)}：{','.join(d[k]) if d[k] else '缺失'}" for k in active)
+        self._add(scope, "error", f"{label} taskId 不一致", show(old), show(new),
+                  f"修改后已填写的链接组（{scope}）taskId 缺失或不一致，请确认属于同一任务。")
 
 class LinkCheckerApp(QWidget):
     """LoveToolbox 兼容入口；界面与检测引擎均在这一个文件中。"""
@@ -614,7 +628,7 @@ class LinkCheckerApp(QWidget):
         title.setStyleSheet("color: #172b4d;")
         root.addWidget(title)
 
-        input_box = QGroupBox("六条链接")
+        input_box = QGroupBox("链接输入（至少填写一组修改前和修改后）")
         input_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QGridLayout(input_box)
         layout.setContentsMargins(13, 22, 13, 15)
@@ -679,7 +693,7 @@ class LinkCheckerApp(QWidget):
         res_layout = QVBoxLayout(results)
         res_layout.setContentsMargins(12, 22, 12, 14)
         res_layout.setSpacing(10)
-        self.summary = QLabel("填写六条链接后，点击“一键检测”。")
+        self.summary = QLabel("至少填写一组修改前、修改后链接，点击“一键检测”。")
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet("color: #58677d; font-weight: 600; padding: 3px;")
         res_layout.addWidget(self.summary)
@@ -692,7 +706,7 @@ class LinkCheckerApp(QWidget):
         self.result_view.setFixedHeight(110)
         self.result_view.setHtml(self._empty_html())
         res_layout.addWidget(self.result_view)
-        note = QLabel("说明：所有实际变化都会显示；曝光/点击须删除原始 partnerId 且有效修改，DP 允许不改。绿色为正常修改，红色为错误或需核对。")
+        note = QLabel("说明：空白链接组将跳过，只填写一侧会提示补全；所有实际变化都会显示；曝光/点击须删除原始 partnerId 且有效修改，DP 允许不改。绿色为正常修改，红色为错误或需核对。")
         note.setWordWrap(True)
         note.setStyleSheet("color: #768398; font-size: 11px;")
         res_layout.addWidget(note)
@@ -709,7 +723,7 @@ class LinkCheckerApp(QWidget):
     def clear_all(self):
         for edit in self.inputs.values():
             edit.clear()
-        self.summary.setText("填写六条链接后，点击“一键检测”。")
+        self.summary.setText("至少填写一组修改前、修改后链接，点击“一键检测”。")
         self.summary.setStyleSheet("color: #58677d; font-weight: 600; padding: 3px;")
         self.result_view.setHtml(self._empty_html())
         self.result_view.setFixedHeight(110)
@@ -717,10 +731,20 @@ class LinkCheckerApp(QWidget):
 
     def run_check(self):
         links = {key: edit.toPlainText().strip() for key, edit in self.inputs.items()}
-        missing = [f"{'修改前' if key.startswith('old') else '修改后'}{LINK_NAMES[key.split('_')[1]]}"
-                   for key, value in links.items() if not value]
-        if missing:
-            QMessageBox.warning(self, "缺少链接", "请填写全部六条链接：\n" + "、".join(missing))
+        incomplete = []
+        complete = []
+        for kind in LINK_TYPES:
+            old = bool(links[f"old_{kind}"])
+            new = bool(links[f"new_{kind}"])
+            if old != new:
+                incomplete.append(f"{LINK_NAMES[kind]}（缺少{'修改后' if old else '修改前'}）")
+            elif old:
+                complete.append(kind)
+        if incomplete:
+            QMessageBox.warning(self, "链接未成对填写", "请补全以下链接组：\n" + "\n".join(incomplete))
+            return
+        if not complete:
+            QMessageBox.warning(self, "缺少链接", "请至少填写一组完整的修改前和修改后链接。")
             return
         engine = LinkAuditEngine()
         findings = engine.audit(links)
