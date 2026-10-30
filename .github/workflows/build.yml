@@ -1,12 +1,11 @@
 name: Build and Release Windows
 
-# 触发规则：只有推送到 v* 标签时触发 (例如 v1.0, v1.0.1)
+# 与原项目保持一致：推送 v* 标签时自动构建并发布。
 on:
   push:
     tags:
       - 'v*'
 
-# 必须赋予写权限，否则无法创建 Release
 permissions:
   contents: write
 
@@ -16,32 +15,61 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install Dependencies
-      run: |
-        pip install -r requirements.txt
-        pip install requests pyinstaller
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install requests pyinstaller
 
-    # --- Windows 打包逻辑 ---
-    - name: Build EXE
-      run: |
-        # --onefile: 单文件
-        # --windowed: 无黑框
-        # --name: 指定生成的文件名
-        pyinstaller --name="LoveToolbox" --windowed --onefile --clean --noconfirm main.py
+      # 自动获取 Windows FFmpeg 静态构建，包含 ffmpeg.exe 和 ffprobe.exe。
+      - name: Download FFmpeg and FFprobe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-release-essentials.zip'
+          $extracted = Join-Path $env:RUNNER_TEMP 'ffmpeg-extracted'
 
-    # --- 发布到 GitHub Release ---
-    - name: Release to GitHub
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
-      with:
-        # 上传 dist 目录下的 exe 文件
-        files: dist/LoveToolbox.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $extracted -Force
+
+          $ffmpeg = Get-ChildItem -Path $extracted -Filter 'ffmpeg.exe' -File -Recurse | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path $extracted -Filter 'ffprobe.exe' -File -Recurse | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) {
+            throw '下载包中未找到 ffmpeg.exe 或 ffprobe.exe，停止打包。'
+          }
+
+          New-Item -ItemType Directory -Path 'vendor/ffmpeg' -Force | Out-Null
+          Copy-Item -Path $ffmpeg.FullName -Destination 'vendor/ffmpeg/ffmpeg.exe' -Force
+          Copy-Item -Path $ffprobe.FullName -Destination 'vendor/ffmpeg/ffprobe.exe' -Force
+
+          if (-not (Test-Path 'vendor/ffmpeg/ffmpeg.exe') -or -not (Test-Path 'vendor/ffmpeg/ffprobe.exe')) {
+            throw 'FFmpeg / FFprobe 文件准备失败。'
+          }
+
+      # 嵌入 onefile 的 ffmpeg 子目录，视频模块可从 sys._MEIPASS/ffmpeg 找到它们。
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --name="LoveToolbox" --windowed --onefile --clean --noconfirm `
+            --add-binary "vendor/ffmpeg/ffmpeg.exe:ffmpeg" `
+            --add-binary "vendor/ffmpeg/ffprobe.exe:ffmpeg" `
+            main.py
+
+          if (-not (Test-Path 'dist/LoveToolbox.exe')) {
+            throw '打包失败：未生成 LoveToolbox.exe'
+          }
+
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/LoveToolbox.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
