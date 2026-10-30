@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt
 
 
 # 当前版本号（仅用于显示，不再提供远程更新）
-CURRENT_VERSION = "v1.2"
+CURRENT_VERSION = "v2.2"
 
 
 class LauncherWindow(QMainWindow):
@@ -58,13 +58,14 @@ class LauncherWindow(QMainWindow):
     def init_apps(self):
         # 首页采用 3 列布局：每排 3 个工具
         self.add_app_icon("🎬\n视频分类器", self.open_sorter_app, 0, 0)
-        self.add_app_icon("📂\n图片分拣器", self.open_image_sorter_app, 0, 1)
+        self.add_app_icon("📂\n图片分拣器", self.open_image_sorter_app, 0, 1, is_special=True)
         self.add_app_icon("🔢\n分组重命名", self.open_renamer_app, 0, 2)
 
-        self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 0, is_special=True)
-        self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 1, 1)
+        self.add_app_icon("⬇️\n全能下载器", self.open_downloader_app, 1, 0)
+        self.add_app_icon("🔗\n链接检测", self.open_link_checker_app, 1, 1, is_special=True)
         self.add_app_icon("📊\n转换数据", self.open_data_converter_app, 1, 2)
         self.add_app_icon("🖼️\n图片转换", self.open_image_converter_app, 2, 0)
+        self.add_app_icon("🎞️\n视频转换", self.open_video_converter_app, 2, 1, is_special=True)
 
     def add_app_icon(self, text, callback, row, col, is_special=False):
         btn = QPushButton(text)
@@ -140,6 +141,10 @@ class LauncherWindow(QMainWindow):
         from apps.image_converter_app import ImageConverterApp
         self.image_converter_window = ImageConverterApp()
         self.image_converter_window.show()
+    def open_video_converter_app(self):
+        from apps.video_converter_app import VideoConverterApp
+        self.video_converter_window = VideoConverterApp()
+        self.video_converter_window.show()
 
 
 if __name__ == "__main__":

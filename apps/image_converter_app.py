@@ -23,6 +23,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSlider,
+    QTabBar,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QDoubleSpinBox,
     QTableWidget,
@@ -122,6 +125,7 @@ class ImageConvertWorker(QThread):
         limit_enabled,
         max_bytes,
         target_size_mode=False,
+        resize_mode="fixed",
         parent=None,
     ):
         super().__init__(parent)
@@ -133,6 +137,7 @@ class ImageConvertWorker(QThread):
         self.limit_enabled = limit_enabled
         self.max_bytes = max_bytes
         self.target_size_mode = target_size_mode
+        self.resize_mode = resize_mode  # proportional: 各图等比例适配目标框；fixed: 强制指定宽高
 
     def run(self):
         success = 0
@@ -197,11 +202,21 @@ class ImageConvertWorker(QThread):
                 raise ValueError("目标尺寸必须大于 0")
             if self.target_width * self.target_height > MAX_IMAGE_PIXELS_FOR_TOOL:
                 raise ValueError("目标尺寸过大，为避免占用过多内存已停止处理")
-            if image.size != (self.target_width, self.target_height):
-                image = image.resize(
-                    (self.target_width, self.target_height),
-                    Image.Resampling.LANCZOS,
+            if self.resize_mode == "proportional":
+                # 用户填写的是最大宽高边界，每张图片分别保持自己的原始比例。
+                # 可缩小也可放大；至少保留 1 像素，不会把竖图拉成横图。
+                factor = min(
+                    self.target_width / image.width,
+                    self.target_height / image.height,
                 )
+                new_width = max(1, min(self.target_width, round(image.width * factor)))
+                new_height = max(1, min(self.target_height, round(image.height * factor)))
+                new_size = (new_width, new_height)
+            else:
+                # 固定尺寸：完全按照填写的宽高转换（允许改变原比例）。
+                new_size = (self.target_width, self.target_height)
+            if image.size != new_size:
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
                 resized = True
 
         # 默认模式：文件大小只是“上限”。
@@ -559,6 +574,8 @@ class ImageConverterApp(QWidget):
         self.save_dir = ""
         self.worker = None
         self._syncing_size_controls = False
+        self._ratio_reference = (16, 9)  # 未选择图片时联动使用 16:9
+        self._last_edited_dimension = "width"
         self.target_size_kb = 500.0
         self._centered_once = False
         self.init_ui()
@@ -613,6 +630,28 @@ class ImageConverterApp(QWidget):
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
                 min-height: 32px;
             }
+            QTabBar#resizeModeTabs::tab {
+                padding: 8px 10px;
+                min-width: 90px;
+                border: 1px solid #c9cdd2;
+                background: #f4f5f7;
+                color: #444;
+            }
+            QTabBar#resizeModeTabs::tab:first {
+                border-top-left-radius: 7px;
+                border-bottom-left-radius: 7px;
+            }
+            QTabBar#resizeModeTabs::tab:last {
+                border-top-right-radius: 7px;
+                border-bottom-right-radius: 7px;
+                border-left: 0;
+            }
+            QTabBar#resizeModeTabs::tab:selected {
+                background: #e3f0ff;
+                color: #125b9a;
+                border-color: #74a7df;
+                font-weight: bold;
+            }
             """
         )
 
@@ -628,7 +667,9 @@ class ImageConverterApp(QWidget):
         top = QHBoxLayout()
         top.setSpacing(14)
         top.addWidget(self._build_files_group(), 3)
-        top.addWidget(self._build_settings_group(), 2)
+        # 设置选项较多，普通窗口高度有限时允许右侧独立纵向滚动，
+        # 不能通过挤压 QLabel 的高度来强行塞入所有控件。
+        top.addWidget(self._build_settings_scroll_area(), 2)
         root.addLayout(top, 1)
 
         root.addWidget(self._build_output_group())
@@ -688,22 +729,64 @@ class ImageConverterApp(QWidget):
         layout.addWidget(self.table, 1)
         return group
 
+    def _build_settings_scroll_area(self):
+        """右侧独立滚动：普通窗口下完整显示说明和设置，不挤占底部操作区。"""
+        scroller = QScrollArea()
+        scroller.setObjectName("imageSettingsScroll")
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroller.setMinimumWidth(300)
+        scroller.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        scroller.setStyleSheet(
+            "QScrollArea#imageSettingsScroll { background: transparent; border: none; }"
+        )
+        scroller.setWidget(self._build_settings_group())
+        return scroller
+
     def _build_settings_group(self):
         group = QGroupBox("转换设置")
+        # 强制按照内容的最小高度布局，超出的部分交给滚动容器。
+        group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(14, 16, 14, 14)
+        layout.setSpacing(10)
 
         self.chk_resize = QCheckBox("修改图片尺寸")
         self.chk_resize.setChecked(True)
         layout.addWidget(self.chk_resize)
 
+        # 与视频转换一致：两个可直接点击的 Tab，默认等比例缩放。
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("调整方式"))
+        self.tabs_resize_mode = QTabBar()
+        self.tabs_resize_mode.setObjectName("resizeModeTabs")
+        self.tabs_resize_mode.setDrawBase(False)
+        self.tabs_resize_mode.setExpanding(True)
+        self.tabs_resize_mode.addTab("等比例缩放")
+        self.tabs_resize_mode.addTab("固定尺寸")
+        self.tabs_resize_mode.setCurrentIndex(0)
+        mode_row.addWidget(self.tabs_resize_mode, 1)
+        layout.addLayout(mode_row)
+
         size_grid = QGridLayout()
-        size_grid.setHorizontalSpacing(12)
+        size_grid.setHorizontalSpacing(8)
+        size_grid.setVerticalSpacing(8)
+        size_grid.setColumnMinimumWidth(0, 48)
+        size_grid.setColumnMinimumWidth(1, 110)
+        size_grid.setColumnMinimumWidth(2, 42)
+        size_grid.setColumnStretch(0, 0)
+        size_grid.setColumnStretch(1, 1)
+        size_grid.setColumnStretch(2, 0)
 
         size_grid.addWidget(QLabel("宽度"), 0, 0)
         self.spin_width = QSpinBox()
+        self.spin_width.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.spin_width.setRange(0, 20000)
         self.spin_width.setSpecialValueText("自动")
         self.spin_width.setValue(0)
+        self.spin_width.setKeyboardTracking(False)
         size_grid.addWidget(self.spin_width, 0, 1)
         width_unit = QLabel("px")
         width_unit.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -718,9 +801,11 @@ class ImageConverterApp(QWidget):
 
         size_grid.addWidget(QLabel("高度"), 1, 0)
         self.spin_height = QSpinBox()
+        self.spin_height.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.spin_height.setRange(0, 20000)
         self.spin_height.setSpecialValueText("自动")
         self.spin_height.setValue(0)
+        self.spin_height.setKeyboardTracking(False)
         size_grid.addWidget(self.spin_height, 1, 1)
         height_unit = QLabel("px")
         height_unit.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -734,10 +819,20 @@ class ImageConverterApp(QWidget):
         size_grid.addWidget(height_unit, 1, 2)
 
         layout.addLayout(size_grid)
-        size_hint = QLabel("选择图片后，会自动使用当前批次中出现次数最多的尺寸。")
-        size_hint.setWordWrap(True)
-        size_hint.setStyleSheet("color: #666;")
-        layout.addWidget(size_hint)
+        self.size_hint = QLabel()
+        self.size_hint.setWordWrap(True)
+        self.size_hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.size_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.size_hint.setStyleSheet("color: #666;")
+        layout.addWidget(self.size_hint)
+
+        self.tabs_resize_mode.currentChanged.connect(self._on_resize_mode_changed)
+        self.spin_width.valueChanged.connect(self._on_width_changed)
+        self.spin_height.valueChanged.connect(self._on_height_changed)
+        # 键盘输入同步另一轴，但不强制改写正在编辑的数字，避免光标跳动。
+        self.spin_width.lineEdit().textEdited.connect(self._on_width_text_edited)
+        self.spin_height.lineEdit().textEdited.connect(self._on_height_text_edited)
+        self._update_resize_note()
 
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
@@ -779,13 +874,107 @@ class ImageConverterApp(QWidget):
         layout.addWidget(self.chk_target_size)
 
         note = QLabel(
-            "默认规则：这里填写的是文件大小上限。例如 500 KB 表示不超过 500 KB；原本 100 KB 的图片不会为了接近 500 KB 而重新压缩。只有勾选上面的“所有图片都尽量调整到这个目标大小”后，才会对全部图片尽量靠近目标值。"
+            "默认只压缩超过大小上限的图片；勾选“尽量调整到目标大小”后，"
+            "所有图片都会尝试接近目标大小。"
         )
         note.setWordWrap(True)
+        note.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        note.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        note.setToolTip(
+            "例如上限为 500 KB 时，原本 100 KB 的图片不会重新压缩；"
+            "只有开启目标大小模式，才会对所有图片重新编码并尽量接近目标值。"
+        )
         note.setStyleSheet("color: #666;")
         layout.addWidget(note)
         layout.addStretch()
         return group
+
+    def _resize_mode(self):
+        return "fixed" if self.tabs_resize_mode.currentIndex() == 1 else "proportional"
+
+    def _set_dimensions(self, width, height):
+        """程序主动更新宽高时避免相互触发，且不改变两项独立的尺寸设置。"""
+        w_blocked = self.spin_width.blockSignals(True)
+        h_blocked = self.spin_height.blockSignals(True)
+        try:
+            self.spin_width.setValue(max(0, min(20000, int(width))))
+            self.spin_height.setValue(max(0, min(20000, int(height))))
+        finally:
+            self.spin_width.blockSignals(w_blocked)
+            self.spin_height.blockSignals(h_blocked)
+
+    def _on_resize_mode_changed(self, *_):
+        if self._resize_mode() == "proportional":
+            self._sync_dimension(self._last_edited_dimension)
+        self._update_resize_note()
+
+    def _on_width_changed(self, _value):
+        self._last_edited_dimension = "width"
+        self._sync_dimension("width")
+
+    def _on_height_changed(self, _value):
+        self._last_edited_dimension = "height"
+        self._sync_dimension("height")
+
+    def _on_width_text_edited(self, text):
+        self._sync_typed_dimension("width", text)
+
+    def _on_height_text_edited(self, text):
+        self._sync_typed_dimension("height", text)
+
+    def _sync_typed_dimension(self, axis, text):
+        """手动输入时实时联动另一轴，不改动正在输入的编辑框和光标。"""
+        self._last_edited_dimension = axis
+        if self._resize_mode() != "proportional" or not text.strip().isdecimal():
+            return
+        value = int(text.strip())
+        if not 1 <= value <= 20000:
+            return
+        ref_width, ref_height = self._ratio_reference
+        if axis == "width":
+            other = self.spin_height
+            calculated = value * ref_height / ref_width
+        else:
+            other = self.spin_width
+            calculated = value * ref_width / ref_height
+        previous = other.blockSignals(True)
+        try:
+            other.setValue(max(1, min(20000, round(calculated))))
+        finally:
+            other.blockSignals(previous)
+
+    def _sync_dimension(self, axis):
+        """箭头、输入确认和切换 Tab 时按批次参考比例联动。"""
+        if self._resize_mode() != "proportional":
+            return
+        ref_width, ref_height = self._ratio_reference
+        if axis == "height":
+            height = self.spin_height.value()
+            if height > 0:
+                width = max(1, min(20000, round(height * ref_width / ref_height)))
+                self._set_dimensions(width, height)
+        else:
+            width = self.spin_width.value()
+            if width > 0:
+                height = max(1, min(20000, round(width * ref_height / ref_width)))
+                self._set_dimensions(width, height)
+
+    def _update_resize_note(self):
+        if self._resize_mode() == "proportional":
+            w, h = self._ratio_reference
+            self.size_hint.setText(
+                f"等比例（参考 {w}:{h}）：宽高自动联动；"
+                "批量处理时，各图片保持自身比例。"
+            )
+            self.size_hint.setToolTip(
+                "输入的宽高为目标边界，每张图片单独按比例适配，"
+                "不会拉伸。默认宽高取本批次最常见的尺寸。"
+            )
+        else:
+            self.size_hint.setText(
+                "固定尺寸：严格按填写的宽高输出，可能拉伸图片。"
+            )
+            self.size_hint.setToolTip("默认宽高取本批次最常见的图片尺寸。")
 
     def _build_output_group(self):
         group = QGroupBox("保存目录")
@@ -886,15 +1075,17 @@ class ImageConverterApp(QWidget):
         counts = Counter(sizes)
         max_count = max(counts.values())
         chosen = next(size for size in sizes if counts[size] == max_count)
-        self.spin_width.setValue(chosen[0])
-        self.spin_height.setValue(chosen[1])
+        self._ratio_reference = chosen
+        self._set_dimensions(chosen[0], chosen[1])
+        self._update_resize_note()
 
     def clear_images(self):
         self.selected_files.clear()
         self.table.setRowCount(0)
         self.save_dir = ""
-        self.spin_width.setValue(0)
-        self.spin_height.setValue(0)
+        self._ratio_reference = (16, 9)
+        self._set_dimensions(0, 0)
+        self._update_resize_note()
         self.lbl_save_dir.setText("选择图片后会自动设为图片所在目录（默认覆盖原图）")
         self.progress.setValue(0)
         self.lbl_status.setText("已清空，请重新选择图片。")
@@ -1022,6 +1213,7 @@ class ImageConverterApp(QWidget):
             resize_enabled=self.chk_resize.isChecked(),
             target_width=width,
             target_height=height,
+            resize_mode=self._resize_mode(),
             limit_enabled=self.chk_limit.isChecked(),
             max_bytes=max_bytes,
             target_size_mode=(
